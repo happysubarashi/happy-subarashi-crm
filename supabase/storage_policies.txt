@@ -1,0 +1,95 @@
+-- ============================================================
+--  Happy Subarashi CRM — Storage Setup
+--  Run AFTER the main schema migration (happy_subarashi_crm_schema_v1.1.sql)
+-- ============================================================
+--
+--  This creates two buckets:
+--    lead-files → private  → activity file uploads (lab results, photos, docs)
+--    avatars    → public   → user profile photos
+--
+--  Run this in Supabase → SQL Editor.
+-- ============================================================
+
+-- ── 1. Create buckets ────────────────────────────────────────
+
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('lead-files', 'lead-files', false, 10485760)  -- 10MB limit
+on conflict (id) do nothing;
+
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('avatars', 'avatars', true, 3145728)  -- 3MB limit
+on conflict (id) do nothing;
+
+
+-- ── 2. RLS: lead-files (private bucket) ─────────────────────
+-- Files are stored under path: {lead_id}/{filename}
+-- Access follows the same rule as the leads table: own + team for leaders,
+-- full access for owner/admin.
+
+create policy "lead-files: authenticated can read accessible leads"
+on storage.objects for select
+to authenticated
+using (
+  bucket_id = 'lead-files'
+  and (
+    public.is_owner_or_admin()
+    or public.can_access_lead((storage.foldername(name))[1]::uuid)
+  )
+);
+
+create policy "lead-files: authenticated can upload to accessible leads"
+on storage.objects for insert
+to authenticated
+with check (
+  bucket_id = 'lead-files'
+  and (
+    public.is_owner_or_admin()
+    or public.can_access_lead((storage.foldername(name))[1]::uuid)
+  )
+);
+
+create policy "lead-files: admin can delete"
+on storage.objects for delete
+to authenticated
+using (
+  bucket_id = 'lead-files'
+  and public.is_owner_or_admin()
+);
+
+
+-- ── 3. RLS: avatars (public bucket) ─────────────────────────
+-- Files are stored under path: {user_id}/avatar-{timestamp}.{ext}
+-- Anyone can view (public bucket); only the owner can upload/replace their own.
+
+create policy "avatars: public read"
+on storage.objects for select
+to public
+using (bucket_id = 'avatars');
+
+create policy "avatars: user uploads own"
+on storage.objects for insert
+to authenticated
+with check (
+  bucket_id = 'avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+
+create policy "avatars: user updates own"
+on storage.objects for update
+to authenticated
+using (
+  bucket_id = 'avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+
+create policy "avatars: user deletes own"
+on storage.objects for delete
+to authenticated
+using (
+  bucket_id = 'avatars'
+  and (storage.foldername(name))[1] = auth.uid()::text
+);
+
+-- ============================================================
+--  Storage setup — COMPLETE
+-- ============================================================

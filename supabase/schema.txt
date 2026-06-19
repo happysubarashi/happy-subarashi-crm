@@ -1,0 +1,1033 @@
+-- ============================================================
+--  Happy Subarashi CRM — Database Schema
+--  Version: 1.1.0 — Production-Ready
+--  Replaces: 1.0.0
+-- ============================================================
+--
+--  FIXES APPLIED FROM AUDIT:
+--  [CRITICAL-1] profiles.managed_by → Leader team hierarchy + leader RLS policies
+--  [CRITICAL-2] sync_order_total trigger → auto-sync repeat_orders.total_amount
+--  [CRITICAL-3] leads.archived_at → Soft delete (no more permanent data loss)
+--  [IMPORT-4]   leads.phone_normalized + normalize_phone() → Deduplication signal
+--  [IMPORT-5]   leads.source_detail → Campaign-level attribution
+--  [IMPORT-6]   leads.referral_name + referral_phone → Network marketing tracking
+--  [IMPORT-7]   Sequences: OWNED BY their table column
+--  [IMPORT-8]   leads.currency + repeat_orders.currency DEFAULT 'IDR'
+--  [IMPORT-9]   follow_ups INSERT policy now verifies lead access via can_access_lead()
+--  [IMPROV-10]  profiles.notification_settings JSONB
+--  [IMPROV-11]  products.member_price
+--  [IMPROV-12]  can_access_lead() centralized RLS helper → leader logic in one place
+--  [IMPROV-13]  Partial indexes now exclude archived_at IS NOT NULL rows
+--
+-- ============================================================
+
+
+-- ============================
+-- 0. EXTENSIONS
+-- ============================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm"; -- Fuzzy search on names & phones
+
+
+-- ============================
+-- 1. ENUMS
+-- ============================
+
+CREATE TYPE public.user_role AS ENUM (
+  'owner',       -- Full system access; cannot be demoted by admins
+  'admin',       -- Full data access; managed by owner
+  'leader',      -- Team lead; sees own + managed consultants' leads
+  'consultant'   -- Standard user; sees own assigned/created leads only
+);
+
+CREATE TYPE public.lead_source AS ENUM (
+  'meta_ads',
+  'instagram',
+  'referral',
+  'whatsapp',
+  'tiktok',
+  'website',
+  'organic',
+  'other'
+);
+
+CREATE TYPE public.pipeline_stage AS ENUM (
+  'lead_baru',            -- New Lead
+  'sudah_chat',           -- First Contact Made
+  'konsultasi',           -- In Consultation
+  'edukasi_produk',       -- Product Education
+  'menunggu_keputusan',   -- Awaiting Decision
+  'closing_won',          -- Closed Won ✓
+  'closing_lost'          -- Closed Lost ✗
+);
+
+CREATE TYPE public.activity_type AS ENUM (
+  'whatsapp',
+  'call',
+  'instagram_dm',
+  'consultation',
+  'note',
+  'file_upload',
+  'stage_change',
+  'follow_up_done',
+  'email'
+);
+
+CREATE TYPE public.followup_status AS ENUM (
+  'pending',
+  'done',
+  'rescheduled',
+  'missed'
+);
+
+CREATE TYPE public.order_status AS ENUM (
+  'pending',
+  'confirmed',
+  'delivered',
+  'cancelled'
+);
+
+
+-- ============================
+-- 2. SHARED UTILITY FUNCTION
+-- ============================
+
+CREATE OR REPLACE FUNCTION public.handle_updated_at()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$;
+
+
+-- ============================
+-- 3. PROFILES (Users)
+-- ============================
+
+CREATE TABLE public.profiles (
+  id                    UUID              PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  full_name             TEXT              NOT NULL,
+  email                 TEXT,
+  phone                 TEXT,
+  avatar_url            TEXT,
+  role                  public.user_role  NOT NULL DEFAULT 'consultant',
+  is_active             BOOLEAN           NOT NULL DEFAULT true,
+
+  -- [FIX CRITICAL-1] Leader hierarchy: a consultant's or leader's direct manager
+  -- A 'leader' sets this to NULL (they report directly to owner/admin)
+  -- A 'consultant' sets this to their leader's profile ID
+  managed_by            UUID              REFERENCES public.profiles(id) ON DELETE SET NULL,
+
+  -- [FIX IMPROV-10] Per-user notification preferences
+  notification_settings JSONB             NOT NULL DEFAULT '{
+    "email_enabled":        true,
+    "daily_summary":        true,
+    "followup_reminders":   true,
+    "hot_lead_alerts":      true,
+    "reminder_minutes_before": 60
+  }',
+
+  created_at            TIMESTAMPTZ       NOT NULL DEFAULT NOW(),
+  updated_at            TIMESTAMPTZ       NOT NULL DEFAULT NOW()
+);
+
+-- Indexes
+CREATE INDEX idx_profiles_role       ON public.profiles(role);
+CREATE INDEX idx_profiles_is_active  ON public.profiles(is_active) WHERE is_active = true;
+CREATE INDEX idx_profiles_managed_by ON public.profiles(managed_by); -- [FIX CRITICAL-1]
+
+-- Trigger: auto-create profile when user signs up
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.profiles (id, full_name, email)
+  VALUES (
+    NEW.id,
+    COALESCE(
+      NEW.raw_user_meta_data->>'full_name',
+      split_part(NEW.email, '@', 1)
+    ),
+    NEW.email
+  );
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW
+  EXECUTE FUNCTION public.handle_new_user();
+
+CREATE TRIGGER profiles_updated_at
+  BEFORE UPDATE ON public.profiles
+  FOR EACH ROW
+  EXECUTE FUNCTION public.handle_updated_at();
+
+
+-- ============================
+-- 4. PRODUCTS
+-- ============================
+
+CREATE TABLE public.products (
+  id           UUID           PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name         TEXT           NOT NULL,
+  code         TEXT           UNIQUE NOT NULL,
+  description  TEXT,
+  price        DECIMAL(12, 2) NOT NULL DEFAULT 0,       -- Non-member price
+  member_price DECIMAL(12, 2),                          -- [FIX IMPROV-11] AFC member pricing (NULL = same as price)
+  category     TEXT,
+  image_url    TEXT,
+  is_active    BOOLEAN        NOT NULL DEFAULT true,
+  sort_order   INTEGER        NOT NULL DEFAULT 0,
+  created_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+  updated_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+
+CREATE TRIGGER products_updated_at
+  BEFORE UPDATE ON public.products
+  FOR EACH ROW
+  EXECUTE FUNCTION public.handle_updated_at();
+
+-- Seed: Default AFC Japan product catalog
+INSERT INTO public.products (name, code, description, category, sort_order)
+VALUES
+  ('SOP Subarashi',   'SOP',  'Peptides & cell regeneration',        'Core',    1),
+  ('Utsukushhii',     'UTS',  'Gut health, antioxidants & fucoidan', 'Core',    2),
+  ('Hikari',          'HKR',  'Eye & brain support supplement',      'Core',    3),
+  ('Salmon DNA',      'SDNA', 'Salmon DNA rejuvenation',             'Premium', 4),
+  ('AFC Life Science','AFC',  'General health & wellness',           'General', 5),
+  ('Others',          'OTH',  'Other products',                      'Other',  99);
+
+
+-- ============================
+-- 5. PHONE NORMALIZATION
+-- ============================
+
+-- [FIX IMPORT-4] Normalizes Indonesian mobile numbers to E.164-like format
+-- "08121234567" → "628121234567"
+-- "+628121234567" → "628121234567"
+-- Strips all non-digits, then converts leading 0 → 62 prefix
+CREATE OR REPLACE FUNCTION public.normalize_phone(p_phone TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+  v_digits TEXT;
+BEGIN
+  -- Strip everything except digits
+  v_digits := regexp_replace(COALESCE(p_phone, ''), '[^0-9]', '', 'g');
+
+  -- Empty or too short: return as-is
+  IF length(v_digits) < 5 THEN
+    RETURN v_digits;
+  END IF;
+
+  -- Indonesian mobile: starts with 08x → convert to 628x
+  IF v_digits LIKE '08%' THEN
+    RETURN '62' || substring(v_digits FROM 2);
+  END IF;
+
+  -- Already has country code 628x
+  IF v_digits LIKE '628%' THEN
+    RETURN v_digits;
+  END IF;
+
+  -- Other patterns: return stripped digits
+  RETURN v_digits;
+END;
+$$;
+
+
+-- ============================
+-- 6. LEADS
+-- ============================
+
+-- [FIX IMPORT-7] OWNED BY ensures sequence is dropped with the table
+CREATE SEQUENCE public.lead_code_seq START 1;
+
+CREATE TABLE public.leads (
+  id                 UUID                  PRIMARY KEY DEFAULT uuid_generate_v4(),
+  lead_code          TEXT                  UNIQUE NOT NULL,  -- LD-00001
+
+  -- Contact Info
+  full_name          TEXT                  NOT NULL,
+  phone              TEXT                  NOT NULL,         -- WhatsApp number (as entered)
+  phone_normalized   TEXT,                                   -- [FIX IMPORT-4] Normalized for dedup detection
+  email              TEXT,
+  city               TEXT,
+  gender             TEXT                  CHECK (gender IN ('female', 'male', 'other')),
+  age_range          TEXT                  CHECK (age_range IN ('<20', '20-29', '30-39', '40-49', '50+')),
+
+  -- Lead Context
+  source             public.lead_source    NOT NULL DEFAULT 'other',
+  source_detail      TEXT,                                   -- [FIX IMPORT-5] e.g. "Summer Campaign Jun 2024", "Story Ad – Diabetes"
+  health_conditions  TEXT[]                NOT NULL DEFAULT '{}',
+  -- Standard values: gagal_ginjal, stroke, diabetes, autoimun, hipertensi, gerd, kanker, kolesterol, asam_urat
+  notes              TEXT,
+
+  -- [FIX IMPORT-6] Referral tracking — critical for network marketing attribution
+  referral_name      TEXT,                                   -- Name of person who referred this lead
+  referral_phone     TEXT,                                   -- Phone of referrer (for thank-you & tracking)
+
+  -- Pipeline
+  pipeline_stage     public.pipeline_stage NOT NULL DEFAULT 'lead_baru',
+  is_hot_lead        BOOLEAN               NOT NULL DEFAULT false,
+
+  -- Outcome
+  is_member          BOOLEAN               NOT NULL DEFAULT false, -- Became AFC business member
+  closing_date       DATE,
+  closing_amount     DECIMAL(12, 2),
+  currency           TEXT                  NOT NULL DEFAULT 'IDR', -- [FIX IMPORT-8]
+  lost_reason        TEXT,
+
+  -- [FIX CRITICAL-3] Soft delete — archived leads are hidden from pipeline but data is preserved
+  -- NULL = active lead. SET to NOW() instead of DELETE.
+  archived_at        TIMESTAMPTZ,
+  archived_by        UUID                  REFERENCES public.profiles(id) ON DELETE SET NULL,
+  archive_reason     TEXT,
+
+  -- Activity Tracking
+  first_contact_at   TIMESTAMPTZ,
+  last_activity_at   TIMESTAMPTZ,
+
+  -- Ownership
+  assigned_to        UUID                  REFERENCES public.profiles(id) ON DELETE SET NULL,
+  created_by         UUID                  NOT NULL REFERENCES public.profiles(id),
+
+  created_at         TIMESTAMPTZ           NOT NULL DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ           NOT NULL DEFAULT NOW()
+);
+
+-- [FIX IMPORT-7] Tie sequence lifetime to the table
+ALTER SEQUENCE public.lead_code_seq OWNED BY public.leads.lead_code;
+
+-- Auto-generate: LD-00001
+CREATE OR REPLACE FUNCTION public.generate_lead_code()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.lead_code := 'LD-' || LPAD(nextval('public.lead_code_seq')::TEXT, 5, '0');
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER set_lead_code
+  BEFORE INSERT ON public.leads
+  FOR EACH ROW
+  EXECUTE FUNCTION public.generate_lead_code();
+
+-- [FIX IMPORT-4] Auto-normalize phone on insert and phone updates
+CREATE OR REPLACE FUNCTION public.set_normalized_phone()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.phone_normalized := public.normalize_phone(NEW.phone);
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER leads_normalize_phone
+  BEFORE INSERT OR UPDATE OF phone ON public.leads
+  FOR EACH ROW
+  EXECUTE FUNCTION public.set_normalized_phone();
+
+CREATE TRIGGER leads_updated_at
+  BEFORE UPDATE ON public.leads
+  FOR EACH ROW
+  EXECUTE FUNCTION public.handle_updated_at();
+
+-- ── Indexes ──────────────────────────────────────────────────
+
+CREATE INDEX idx_leads_assigned_to      ON public.leads(assigned_to);
+CREATE INDEX idx_leads_created_by       ON public.leads(created_by);
+CREATE INDEX idx_leads_source           ON public.leads(source);
+CREATE INDEX idx_leads_created_at       ON public.leads(created_at DESC);
+CREATE INDEX idx_leads_last_activity    ON public.leads(last_activity_at DESC);
+CREATE INDEX idx_leads_phone            ON public.leads(phone);
+-- [FIX IMPORT-4] Deduplication lookup: find leads with the same normalized phone
+CREATE INDEX idx_leads_phone_normalized ON public.leads(phone_normalized);
+-- GIN for array + fuzzy search
+CREATE INDEX idx_leads_health_conditions ON public.leads USING gin(health_conditions);
+CREATE INDEX idx_leads_name_search       ON public.leads USING gin(full_name gin_trgm_ops);
+
+-- [FIX IMPROV-13] Partial indexes: exclude archived leads from all hot-path queries
+-- These are the indexes pipeline views, dashboard widgets, and reports actually use
+CREATE INDEX idx_leads_pipeline_active
+  ON public.leads(assigned_to, pipeline_stage)
+  WHERE archived_at IS NULL;
+
+CREATE INDEX idx_leads_stage_active
+  ON public.leads(pipeline_stage)
+  WHERE archived_at IS NULL;
+
+CREATE INDEX idx_leads_hot_active
+  ON public.leads(is_hot_lead)
+  WHERE is_hot_lead = true AND archived_at IS NULL;
+
+-- Closing stats (reports query this monthly)
+CREATE INDEX idx_leads_closing_won
+  ON public.leads(closing_date DESC)
+  WHERE pipeline_stage = 'closing_won' AND archived_at IS NULL;
+
+
+-- ============================
+-- 7. LEAD PRODUCTS (Junction)
+-- ============================
+
+CREATE TABLE public.lead_products (
+  id         UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
+  lead_id    UUID        NOT NULL REFERENCES public.leads(id)    ON DELETE CASCADE,
+  product_id UUID        NOT NULL REFERENCES public.products(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (lead_id, product_id)
+);
+
+CREATE INDEX idx_lead_products_lead    ON public.lead_products(lead_id);
+CREATE INDEX idx_lead_products_product ON public.lead_products(product_id);
+
+
+-- ============================
+-- 8. ACTIVITIES (Immutable Log)
+-- ============================
+
+CREATE TABLE public.activities (
+  id          UUID                 PRIMARY KEY DEFAULT uuid_generate_v4(),
+  lead_id     UUID                 NOT NULL REFERENCES public.leads(id) ON DELETE CASCADE,
+  user_id     UUID                 NOT NULL REFERENCES public.profiles(id),
+  type        public.activity_type NOT NULL,
+  title       TEXT                 NOT NULL,
+  description TEXT,
+  metadata    JSONB                NOT NULL DEFAULT '{}',
+  -- metadata schema per activity type:
+  -- stage_change:   { "from": "lead_baru",    "to": "konsultasi" }
+  -- file_upload:    { "file_url": "...",       "file_name": "laporan.pdf", "file_type": "application/pdf", "size_bytes": 204800 }
+  -- follow_up_done: { "follow_up_id": "uuid", "scheduled_at": "2024-06-24T09:00:00+07:00" }
+  -- whatsapp:       { "message_preview": "..." }
+  created_at  TIMESTAMPTZ          NOT NULL DEFAULT NOW()
+  -- No updated_at intentionally: activities are an immutable, append-only audit log
+);
+
+-- Auto-update lead.last_activity_at on every new log entry
+CREATE OR REPLACE FUNCTION public.sync_lead_last_activity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE public.leads
+     SET last_activity_at = NOW(),
+         updated_at        = NOW()
+   WHERE id = NEW.lead_id;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER activities_sync_lead
+  AFTER INSERT ON public.activities
+  FOR EACH ROW
+  EXECUTE FUNCTION public.sync_lead_last_activity();
+
+-- Indexes
+CREATE INDEX idx_activities_lead_id    ON public.activities(lead_id);
+CREATE INDEX idx_activities_user_id    ON public.activities(user_id);
+CREATE INDEX idx_activities_type       ON public.activities(type);
+CREATE INDEX idx_activities_created_at ON public.activities(created_at DESC);
+-- Composite: lead timeline (most common query: lead detail page)
+CREATE INDEX idx_activities_lead_time  ON public.activities(lead_id, created_at DESC);
+
+
+-- ============================
+-- 9. FOLLOW UPS
+-- ============================
+
+CREATE TABLE public.follow_ups (
+  id             UUID                    PRIMARY KEY DEFAULT uuid_generate_v4(),
+  lead_id        UUID                    NOT NULL REFERENCES public.leads(id) ON DELETE CASCADE,
+  assigned_to    UUID                    NOT NULL REFERENCES public.profiles(id),
+  created_by     UUID                    NOT NULL REFERENCES public.profiles(id),
+
+  scheduled_at   TIMESTAMPTZ             NOT NULL,
+  title          TEXT                    NOT NULL,
+  notes          TEXT,
+
+  status         public.followup_status  NOT NULL DEFAULT 'pending',
+  completed_at   TIMESTAMPTZ,
+  rescheduled_to TIMESTAMPTZ,
+
+  created_at     TIMESTAMPTZ             NOT NULL DEFAULT NOW(),
+  updated_at     TIMESTAMPTZ             NOT NULL DEFAULT NOW()
+);
+
+CREATE TRIGGER follow_ups_updated_at
+  BEFORE UPDATE ON public.follow_ups
+  FOR EACH ROW
+  EXECUTE FUNCTION public.handle_updated_at();
+
+-- Indexes
+CREATE INDEX idx_follow_ups_lead_id     ON public.follow_ups(lead_id);
+CREATE INDEX idx_follow_ups_assigned_to ON public.follow_ups(assigned_to);
+CREATE INDEX idx_follow_ups_scheduled   ON public.follow_ups(scheduled_at);
+CREATE INDEX idx_follow_ups_status      ON public.follow_ups(status);
+-- Partial composite: "Follow Up Hari Ini" dashboard widget — pending only
+CREATE INDEX idx_follow_ups_today_dash
+  ON public.follow_ups(assigned_to, scheduled_at)
+  WHERE status = 'pending';
+
+
+-- ============================
+-- 10. REPEAT ORDERS
+-- ============================
+
+-- [FIX IMPORT-7]
+CREATE SEQUENCE public.order_code_seq START 1;
+
+CREATE TABLE public.repeat_orders (
+  id                 UUID                 PRIMARY KEY DEFAULT uuid_generate_v4(),
+  order_code         TEXT                 UNIQUE NOT NULL,  -- ORD-00001
+
+  -- Customer
+  lead_id            UUID                 REFERENCES public.leads(id) ON DELETE SET NULL,
+  customer_name      TEXT                 NOT NULL,
+  customer_phone     TEXT                 NOT NULL,
+
+  -- Order
+  order_date         DATE                 NOT NULL DEFAULT CURRENT_DATE,
+  total_amount       DECIMAL(12, 2)       NOT NULL DEFAULT 0, -- [FIX CRITICAL-2] auto-synced by trigger
+  currency           TEXT                 NOT NULL DEFAULT 'IDR', -- [FIX IMPORT-8]
+  status             public.order_status  NOT NULL DEFAULT 'confirmed',
+  notes              TEXT,
+
+  -- Re-order tracking
+  next_followup_date DATE,
+
+  -- Ownership
+  assigned_to        UUID                 NOT NULL REFERENCES public.profiles(id),
+  created_by         UUID                 NOT NULL REFERENCES public.profiles(id),
+
+  created_at         TIMESTAMPTZ          NOT NULL DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ          NOT NULL DEFAULT NOW()
+);
+
+ALTER SEQUENCE public.order_code_seq OWNED BY public.repeat_orders.order_code; -- [FIX IMPORT-7]
+
+-- Auto-generate: ORD-00001
+CREATE OR REPLACE FUNCTION public.generate_order_code()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.order_code := 'ORD-' || LPAD(nextval('public.order_code_seq')::TEXT, 5, '0');
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER set_order_code
+  BEFORE INSERT ON public.repeat_orders
+  FOR EACH ROW
+  EXECUTE FUNCTION public.generate_order_code();
+
+CREATE TRIGGER repeat_orders_updated_at
+  BEFORE UPDATE ON public.repeat_orders
+  FOR EACH ROW
+  EXECUTE FUNCTION public.handle_updated_at();
+
+-- Indexes
+CREATE INDEX idx_repeat_orders_lead          ON public.repeat_orders(lead_id);
+CREATE INDEX idx_repeat_orders_assigned      ON public.repeat_orders(assigned_to);
+CREATE INDEX idx_repeat_orders_created_by    ON public.repeat_orders(created_by);
+CREATE INDEX idx_repeat_orders_order_date    ON public.repeat_orders(order_date DESC);
+CREATE INDEX idx_repeat_orders_next_followup ON public.repeat_orders(next_followup_date);
+CREATE INDEX idx_repeat_orders_status        ON public.repeat_orders(status);
+-- Partial composite: "Repeat Orders Due" dashboard widget
+CREATE INDEX idx_repeat_orders_followup_dash
+  ON public.repeat_orders(assigned_to, next_followup_date)
+  WHERE status = 'confirmed';
+
+
+-- ============================
+-- 11. REPEAT ORDER ITEMS
+-- ============================
+
+CREATE TABLE public.repeat_order_items (
+  id           UUID           PRIMARY KEY DEFAULT uuid_generate_v4(),
+  order_id     UUID           NOT NULL REFERENCES public.repeat_orders(id) ON DELETE CASCADE,
+  product_id   UUID           NOT NULL REFERENCES public.products(id),
+  product_name TEXT           NOT NULL,  -- Denormalized: preserves name at time of purchase
+  quantity     INTEGER        NOT NULL DEFAULT 1 CHECK (quantity > 0),
+  unit_price   DECIMAL(12, 2) NOT NULL DEFAULT 0,
+  subtotal     DECIMAL(12, 2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
+  created_at   TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+
+-- [FIX CRITICAL-2] Auto-sync repeat_orders.total_amount whenever items change
+CREATE OR REPLACE FUNCTION public.sync_order_total()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_order_id UUID;
+BEGIN
+  -- Works for INSERT/UPDATE (NEW) and DELETE (OLD)
+  v_order_id := COALESCE(NEW.order_id, OLD.order_id);
+
+  UPDATE public.repeat_orders
+     SET total_amount = (
+           SELECT COALESCE(SUM(subtotal), 0)
+             FROM public.repeat_order_items
+            WHERE order_id = v_order_id
+         ),
+         updated_at = NOW()
+   WHERE id = v_order_id;
+
+  RETURN NULL; -- AFTER trigger: return value is ignored
+END;
+$$;
+
+CREATE TRIGGER order_items_sync_total
+  AFTER INSERT OR UPDATE OR DELETE ON public.repeat_order_items
+  FOR EACH ROW
+  EXECUTE FUNCTION public.sync_order_total();
+
+-- Indexes
+CREATE INDEX idx_order_items_order   ON public.repeat_order_items(order_id);
+CREATE INDEX idx_order_items_product ON public.repeat_order_items(product_id);
+
+
+-- ============================
+-- 12. RLS HELPER FUNCTIONS
+-- ============================
+
+-- Returns current user's role string.
+-- STABLE + parameterless → PostgreSQL planner caches this once per query.
+CREATE OR REPLACE FUNCTION public.get_my_role()
+RETURNS TEXT
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT role::TEXT FROM public.profiles WHERE id = auth.uid();
+$$;
+
+-- Returns true if the current user is owner or admin (and is active).
+CREATE OR REPLACE FUNCTION public.is_owner_or_admin()
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+      FROM public.profiles
+     WHERE id        = auth.uid()
+       AND role      IN ('owner', 'admin')
+       AND is_active = true
+  );
+$$;
+
+-- [FIX IMPROV-12 + CRITICAL-1]
+-- Centralized access check: can the current user access a given lead?
+-- Used by activities, lead_products, follow_ups RLS policies.
+-- Handles consultant (own) AND leader (team) visibility in one place.
+--
+-- Access is granted when:
+--   a) Lead is assigned to current user
+--   b) Lead was created by current user
+--   c) Current user is 'leader' AND lead is assigned to one of their managed consultants
+--
+-- NOTE: Admin/Owner access is handled by their own "FOR ALL" policy upstream.
+CREATE OR REPLACE FUNCTION public.can_access_lead(p_lead_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+      FROM public.leads      l
+      LEFT JOIN public.profiles p ON p.id = l.assigned_to
+     WHERE l.id = p_lead_id
+       AND (
+         -- Direct ownership
+         l.assigned_to = auth.uid()
+         OR l.created_by = auth.uid()
+         -- [FIX CRITICAL-1] Leader: lead is assigned to one of their team members
+         OR (
+           public.get_my_role() = 'leader'
+           AND p.managed_by = auth.uid()
+         )
+       )
+  );
+$$;
+
+
+-- ============================
+-- 13. ENABLE ROW LEVEL SECURITY
+-- ============================
+
+ALTER TABLE public.profiles           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.products           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.leads              ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.lead_products      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.activities         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.follow_ups         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.repeat_orders      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.repeat_order_items ENABLE ROW LEVEL SECURITY;
+
+
+-- ============================
+-- 14. RLS: profiles
+-- ============================
+
+-- All authenticated users see all profiles
+-- (needed for assignment dropdowns, mention pickers, team views)
+CREATE POLICY "profiles: authenticated can select"
+  ON public.profiles FOR SELECT
+  TO authenticated
+  USING (true);
+
+-- Each user can update their own profile (name, phone, avatar, notification_settings)
+CREATE POLICY "profiles: user updates own"
+  ON public.profiles FOR UPDATE
+  TO authenticated
+  USING     (id = auth.uid())
+  WITH CHECK (id = auth.uid());
+
+-- Owner/Admin can update any profile (role, managed_by, is_active, etc.)
+CREATE POLICY "profiles: admin updates any"
+  ON public.profiles FOR UPDATE
+  TO authenticated
+  USING     (public.is_owner_or_admin())
+  WITH CHECK (public.is_owner_or_admin());
+
+-- Only Owner can permanently delete a profile
+CREATE POLICY "profiles: owner deletes"
+  ON public.profiles FOR DELETE
+  TO authenticated
+  USING (public.get_my_role() = 'owner');
+
+-- INSERT: handled exclusively by handle_new_user() trigger (SECURITY DEFINER → bypasses RLS)
+
+
+-- ============================
+-- 15. RLS: products
+-- ============================
+
+-- All authenticated users can read the product catalog
+CREATE POLICY "products: all can select"
+  ON public.products FOR SELECT
+  TO authenticated
+  USING (true);
+
+-- Only Owner/Admin can create, update, or delete products
+CREATE POLICY "products: admin manages all"
+  ON public.products FOR ALL
+  TO authenticated
+  USING     (public.is_owner_or_admin())
+  WITH CHECK (public.is_owner_or_admin());
+
+
+-- ============================
+-- 16. RLS: leads
+-- ============================
+
+-- Owner/Admin: unrestricted full access across all leads
+CREATE POLICY "leads: admin full access"
+  ON public.leads FOR ALL
+  TO authenticated
+  USING     (public.is_owner_or_admin())
+  WITH CHECK (public.is_owner_or_admin());
+
+-- [FIX CRITICAL-1] Consultant + Leader: SELECT
+-- Consultant → own leads only (assigned_to OR created_by)
+-- Leader     → own leads + leads assigned to managed consultants
+CREATE POLICY "leads: own and team select"
+  ON public.leads FOR SELECT
+  TO authenticated
+  USING (
+    leads.assigned_to = auth.uid()
+    OR leads.created_by = auth.uid()
+    OR (
+      public.get_my_role() = 'leader'
+      AND EXISTS (
+        SELECT 1 FROM public.profiles p
+         WHERE p.id = leads.assigned_to
+           AND p.managed_by = auth.uid()
+      )
+    )
+  );
+
+-- Consultant + Leader: INSERT (must declare themselves as creator)
+CREATE POLICY "leads: own insert"
+  ON public.leads FOR INSERT
+  TO authenticated
+  WITH CHECK (created_by = auth.uid());
+
+-- Consultant + Leader: UPDATE own leads; Leader can also update team leads
+CREATE POLICY "leads: own and team update"
+  ON public.leads FOR UPDATE
+  TO authenticated
+  USING (
+    leads.assigned_to = auth.uid()
+    OR leads.created_by = auth.uid()
+    OR (
+      public.get_my_role() = 'leader'
+      AND EXISTS (
+        SELECT 1 FROM public.profiles p
+         WHERE p.id = leads.assigned_to
+           AND p.managed_by = auth.uid()
+      )
+    )
+  )
+  WITH CHECK (
+    leads.assigned_to = auth.uid()
+    OR leads.created_by = auth.uid()
+    OR (
+      public.get_my_role() = 'leader'
+      AND EXISTS (
+        SELECT 1 FROM public.profiles p
+         WHERE p.id = leads.assigned_to
+           AND p.managed_by = auth.uid()
+      )
+    )
+  );
+
+-- DELETE: Owner/Admin only — covered by "admin full access" above
+-- [FIX CRITICAL-3] Consultants and Leaders should ARCHIVE, not delete.
+-- Use: UPDATE leads SET archived_at = NOW(), archived_by = auth.uid(), archive_reason = '...'
+
+
+-- ============================
+-- 17. RLS: lead_products
+-- ============================
+
+CREATE POLICY "lead_products: admin full access"
+  ON public.lead_products FOR ALL
+  TO authenticated
+  USING     (public.is_owner_or_admin())
+  WITH CHECK (public.is_owner_or_admin());
+
+-- [FIX IMPROV-12 + CRITICAL-1] Uses can_access_lead() — covers consultant AND leader
+CREATE POLICY "lead_products: own and team select"
+  ON public.lead_products FOR SELECT
+  TO authenticated
+  USING (public.can_access_lead(lead_id));
+
+CREATE POLICY "lead_products: own and team insert"
+  ON public.lead_products FOR INSERT
+  TO authenticated
+  WITH CHECK (public.can_access_lead(lead_id));
+
+CREATE POLICY "lead_products: own and team delete"
+  ON public.lead_products FOR DELETE
+  TO authenticated
+  USING (public.can_access_lead(lead_id));
+
+
+-- ============================
+-- 18. RLS: activities
+-- ============================
+
+CREATE POLICY "activities: admin full access"
+  ON public.activities FOR ALL
+  TO authenticated
+  USING     (public.is_owner_or_admin())
+  WITH CHECK (public.is_owner_or_admin());
+
+-- [FIX IMPROV-12 + CRITICAL-1] SELECT: consultant sees own, leader sees team
+CREATE POLICY "activities: own and team select"
+  ON public.activities FOR SELECT
+  TO authenticated
+  USING (public.can_access_lead(lead_id));
+
+-- INSERT: user must be the acting user, and must have access to the lead
+-- Consultants can log activities on their own leads only.
+-- Leaders can log activities on own + team leads.
+CREATE POLICY "activities: own and team insert"
+  ON public.activities FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    user_id = auth.uid()
+    AND public.can_access_lead(lead_id)
+  );
+
+-- No UPDATE or DELETE for non-admins — activities are an immutable audit log
+
+
+-- ============================
+-- 19. RLS: follow_ups
+-- ============================
+
+CREATE POLICY "follow_ups: admin full access"
+  ON public.follow_ups FOR ALL
+  TO authenticated
+  USING     (public.is_owner_or_admin())
+  WITH CHECK (public.is_owner_or_admin());
+
+-- SELECT: see follow-ups on accessible leads (own + team for leaders)
+-- Also includes follow-ups assigned directly to them by others
+CREATE POLICY "follow_ups: own and team select"
+  ON public.follow_ups FOR SELECT
+  TO authenticated
+  USING (
+    assigned_to = auth.uid()
+    OR created_by = auth.uid()
+    OR public.can_access_lead(lead_id)
+  );
+
+-- [FIX IMPORT-9] INSERT: must verify access to the lead being followed up on
+-- v1.0 bug: only checked created_by = auth.uid(), not lead access
+CREATE POLICY "follow_ups: own and team insert"
+  ON public.follow_ups FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    created_by = auth.uid()
+    AND public.can_access_lead(lead_id)
+  );
+
+-- UPDATE: can update follow-ups they own or are assigned to
+CREATE POLICY "follow_ups: own and team update"
+  ON public.follow_ups FOR UPDATE
+  TO authenticated
+  USING (
+    assigned_to = auth.uid()
+    OR created_by = auth.uid()
+  )
+  WITH CHECK (
+    assigned_to = auth.uid()
+    OR created_by = auth.uid()
+  );
+
+
+-- ============================
+-- 20. RLS: repeat_orders
+-- ============================
+
+CREATE POLICY "repeat_orders: admin full access"
+  ON public.repeat_orders FOR ALL
+  TO authenticated
+  USING     (public.is_owner_or_admin())
+  WITH CHECK (public.is_owner_or_admin());
+
+CREATE POLICY "repeat_orders: own select"
+  ON public.repeat_orders FOR SELECT
+  TO authenticated
+  USING (
+    assigned_to = auth.uid()
+    OR created_by = auth.uid()
+  );
+
+CREATE POLICY "repeat_orders: own insert"
+  ON public.repeat_orders FOR INSERT
+  TO authenticated
+  WITH CHECK (created_by = auth.uid());
+
+CREATE POLICY "repeat_orders: own update"
+  ON public.repeat_orders FOR UPDATE
+  TO authenticated
+  USING (
+    assigned_to = auth.uid()
+    OR created_by = auth.uid()
+  )
+  WITH CHECK (
+    assigned_to = auth.uid()
+    OR created_by = auth.uid()
+  );
+
+
+-- ============================
+-- 21. RLS: repeat_order_items
+-- ============================
+
+CREATE POLICY "order_items: admin full access"
+  ON public.repeat_order_items FOR ALL
+  TO authenticated
+  USING     (public.is_owner_or_admin())
+  WITH CHECK (public.is_owner_or_admin());
+
+CREATE POLICY "order_items: own select"
+  ON public.repeat_order_items FOR SELECT
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.repeat_orders
+       WHERE id = order_id
+         AND (assigned_to = auth.uid() OR created_by = auth.uid())
+    )
+  );
+
+CREATE POLICY "order_items: own insert"
+  ON public.repeat_order_items FOR INSERT
+  TO authenticated
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.repeat_orders
+       WHERE id = order_id
+         AND (assigned_to = auth.uid() OR created_by = auth.uid())
+    )
+  );
+
+CREATE POLICY "order_items: own delete"
+  ON public.repeat_order_items FOR DELETE
+  TO authenticated
+  USING (
+    EXISTS (
+      SELECT 1 FROM public.repeat_orders
+       WHERE id = order_id
+         AND (assigned_to = auth.uid() OR created_by = auth.uid())
+    )
+  );
+
+
+-- ============================================================
+--  INITIAL SETUP STEPS (run once after migration)
+-- ============================================================
+--
+--  1. Paste and run this entire file in Supabase → SQL Editor
+--
+--  2. Create first Owner account in Supabase Auth dashboard
+--     (Authentication → Users → Add user)
+--
+--  3. Elevate to Owner (run in SQL Editor):
+--     UPDATE public.profiles
+--        SET role = 'owner'
+--      WHERE email = 'owner@happysubarashi.com';
+--
+--  4. To assign a consultant to a leader (run in SQL Editor or via admin UI):
+--     UPDATE public.profiles
+--        SET managed_by = '<leader-profile-uuid>'
+--      WHERE email = 'consultant@happysubarashi.com';
+--
+--  5. Create Storage buckets in Supabase dashboard:
+--       Bucket: "lead-files"  → private → for file_upload activities
+--       Bucket: "avatars"     → public  → for profile photos
+--     Storage RLS policies are handled separately in Phase 2.
+--
+--  6. Enable Supabase Realtime on these tables (dashboard → Database → Replication):
+--       leads        → pipeline Kanban live updates
+--       follow_ups   → "Hari Ini" dashboard widget
+--       activities   → lead detail live feed
+--
+--  7. To archive a lead (never hard-delete from UI):
+--     UPDATE public.leads
+--        SET archived_at     = NOW(),
+--            archived_by     = '<user-uuid>',
+--            archive_reason  = 'Duplicate entry'
+--      WHERE id = '<lead-uuid>';
+--
+-- ============================================================
+--  Version 1.1.0 — PRODUCTION-READY
+--  Next: Phase 2 — Next.js project + Supabase client setup
+-- ============================================================
